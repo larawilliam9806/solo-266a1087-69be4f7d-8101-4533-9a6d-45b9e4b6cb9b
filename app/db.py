@@ -90,6 +90,34 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         conn.execute("COMMIT")
 
 
+@contextmanager
+def read_snapshot(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """Run every SELECT against one consistent database snapshot.
+
+    ``BEGIN DEFERRED`` takes the snapshot at its first read and keeps it until
+    the transaction ends, so a status read cannot combine rows written before
+    and after a concurrent detail submission or publish.
+
+    In WAL mode a deferred transaction only holds a read snapshot: it never
+    takes a write lock, so an open status read cannot block a detail submission
+    or a publish (for this quarter or any other).  Writers continue and only
+    the reader keeps its older view until it commits.
+    """
+    if conn.in_transaction:
+        # Already inside a transaction (e.g. the caller opened one): it
+        # already provides a snapshot and must not be ended here.
+        yield conn
+        return
+    conn.execute("BEGIN DEFERRED")
+    try:
+        yield conn
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    else:
+        conn.execute("COMMIT")
+
+
 def resolve_db_path(path: str) -> str:
     """Anchor relative paths at the project root, not the process cwd."""
     if path == ":memory:" or path.startswith("file:"):

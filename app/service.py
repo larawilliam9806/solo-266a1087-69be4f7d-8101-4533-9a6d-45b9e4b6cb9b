@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Sequence
 
 from . import suppression
-from .db import transaction
+from .db import read_snapshot, transaction
 from .errors import ApiError, conflict, not_found
 from .models import (
     DetailSubmission,
@@ -342,10 +342,14 @@ class BulletinService:
                 # is kept so the rejection can name it explicitly.
                 previous_mask = (self._mask_row(conn, quarter, current_version)
                                  if current_version else None)
+                # Read the returned status inside the same write transaction:
+                # it shows exactly the state this submission produced, and a
+                # failed submission (raised above) rolls back without touching
+                # the previous version or mask.
+                state = self._admin_state(conn, quarter)
         finally:
             conn.close()
 
-        state = self.get_admin_state(quarter)
         state["detail_version"] = new_version
         state["invalidated_mask_version"] = (
             previous_mask["mask_version"] if previous_mask is not None else None
@@ -428,10 +432,12 @@ class BulletinService:
                         now(), token_id,
                     ),
                 )
+                # Same transaction: the returned state describes exactly the
+                # detail version and mask this request wrote.
+                state = self._admin_state(conn, quarter)
         finally:
             conn.close()
 
-        state = self.get_admin_state(quarter)
         state["mask_version"] = mask_version
         state["analysis"] = analysis.as_dict()
         state["preview"] = [issue.as_dict() for issue in analysis.issues]
@@ -445,35 +451,38 @@ class BulletinService:
 
         conn = connect(self.db_path)
         try:
-            self._quarter_row(conn, quarter)
-            latest = self._latest_detail(conn, quarter)
-            if latest is None:
-                raise ApiError(409, "detail_required",
-                               "submit a detail version before requesting "
-                               "suppression advice")
-            if detail_version is not None and detail_version != latest["version"]:
-                raise conflict(
-                    "stale_detail_version",
-                    "suppression advice is only available for the current "
-                    "detail version",
-                    {"requested": detail_version,
-                     "current_detail_version": latest["version"]},
-                )
-            values = json.loads(latest["values_json"])
-            must_public = _cells(json.loads(latest["must_public"]))
-            if cells is None:
-                stored = self._mask_row(conn, quarter, latest["version"])
-                base = (_cells(json.loads(stored["cells_json"]))
-                        if stored else suppression.default_mask(values, must_public))
-            else:
-                base = _cells(cells)
-                n_rows, n_cols = len(values), len(values[0])
-                for r, c in base:
-                    if not (0 <= r < n_rows and 0 <= c < n_cols):
-                        raise ApiError(422, "cell_out_of_range",
-                                       f"cell ({r},{c}) is outside the "
-                                       f"{n_rows}x{n_cols} table",
-                                       {"row": r, "col": c})
+            with read_snapshot(conn):
+                self._quarter_row(conn, quarter)
+                latest = self._latest_detail(conn, quarter)
+                if latest is None:
+                    raise ApiError(409, "detail_required",
+                                   "submit a detail version before requesting "
+                                   "suppression advice")
+                if detail_version is not None and \
+                        detail_version != latest["version"]:
+                    raise conflict(
+                        "stale_detail_version",
+                        "suppression advice is only available for the current "
+                        "detail version",
+                        {"requested": detail_version,
+                         "current_detail_version": latest["version"]},
+                    )
+                values = json.loads(latest["values_json"])
+                must_public = _cells(json.loads(latest["must_public"]))
+                if cells is None:
+                    stored = self._mask_row(conn, quarter, latest["version"])
+                    base = (_cells(json.loads(stored["cells_json"]))
+                            if stored
+                            else suppression.default_mask(values, must_public))
+                else:
+                    base = _cells(cells)
+                    n_rows, n_cols = len(values), len(values[0])
+                    for r, c in base:
+                        if not (0 <= r < n_rows and 0 <= c < n_cols):
+                            raise ApiError(422, "cell_out_of_range",
+                                           f"cell ({r},{c}) is outside the "
+                                           f"{n_rows}x{n_cols} table",
+                                           {"row": r, "col": c})
         finally:
             conn.close()
 
@@ -578,6 +587,7 @@ class BulletinService:
                 payload = self._build_payload(
                     quarter, q, values, row_totals, col_totals, masked,
                 )
+                published_at = payload["published_at"]
                 try:
                     conn.execute(
                         "INSERT INTO bulletins(quarter, detail_version, "
@@ -588,7 +598,7 @@ class BulletinService:
                             latest["version"],
                             mask_row["mask_version"],
                             json.dumps(payload),
-                            now(),
+                            published_at,
                             token_id,
                         ),
                     )
@@ -670,23 +680,41 @@ class BulletinService:
         return out
 
     def get_admin_state(self, quarter: str) -> dict[str, Any]:
-        """Editor-only view: versions plus validation of the current mask."""
+        """Editor-only view: versions plus validation of the current mask.
+
+        Every row in the response comes from a single database snapshot, so
+        the detail version, its masking plan, the derived analysis, the version
+        list and the published bulletin always belong together.  A concurrent
+        detail submission or publish is therefore either fully visible or not
+        visible at all, never half-applied.
+        """
         from .db import connect
 
         conn = connect(self.db_path)
         try:
-            q = self._quarter_row(conn, quarter)
-            latest = self._latest_detail(conn, quarter)
-            mask_row = (self._mask_row(conn, quarter, latest["version"])
-                        if latest else None)
-            bulletin = self._bulletin_row(conn, quarter)
-            versions = conn.execute(
-                "SELECT version, created_at FROM detail_versions "
-                "WHERE quarter=? ORDER BY version",
-                (quarter,),
-            ).fetchall()
+            with read_snapshot(conn):
+                return self._admin_state(conn, quarter)
         finally:
             conn.close()
+
+    def _admin_state(self, conn, quarter: str) -> dict[str, Any]:
+        """Build the editor state from ``conn`` without opening new reads.
+
+        The caller decides the isolation: a read snapshot for pure reads, or
+        the write transaction that just mutated the quarter.  Keeping all
+        SELECTs on one connection/transaction is what makes the returned
+        fields mutually consistent.
+        """
+        q = self._quarter_row(conn, quarter)
+        latest = self._latest_detail(conn, quarter)
+        mask_row = (self._mask_row(conn, quarter, latest["version"])
+                    if latest else None)
+        bulletin = self._bulletin_row(conn, quarter)
+        versions = conn.execute(
+            "SELECT version, created_at FROM detail_versions "
+            "WHERE quarter=? ORDER BY version",
+            (quarter,),
+        ).fetchall()
 
         state: dict[str, Any] = {
             "quarter": quarter,
@@ -709,6 +737,9 @@ class BulletinService:
             "published_at": bulletin["published_at"] if bulletin else None,
             "bulletin_detail_version": (
                 bulletin["detail_version"] if bulletin else None
+            ),
+            "bulletin_mask_version": (
+                bulletin["mask_version"] if bulletin else None
             ),
         }
         if latest and mask_row:

@@ -106,7 +106,21 @@ pytest                             # 测试
   发布失败不会影响已发布的公报，`GET /api/v1/bulletins/{quarter}` 照常可查。
 * 发布是事务性的：校验、快照写入、唯一约束在同一 `BEGIN IMMEDIATE` 事务里完成，并发也不会有第二份。
 
-### 6. 公开查询
+### 6. 编辑状态查询
+
+`GET /api/v1/editor/quarters/{quarter}`
+
+一次读取（`BEGIN DEFERRED` 读快照）返回同一份明细快照：`current_detail_version`、
+`detail_versions` 列表、该版本的遮盖 `mask_version` / `masked_cells` 与 `analysis`，
+以及公报归属 `published` / `bulletin_detail_version` / `bulletin_mask_version`。
+并发的明细提交或发布要么整体可见、要么整体不可见，不会把旧明细的版本号、遮盖或分析
+与新版本列表、已发布公报拼在一起。
+
+读快照在 WAL 模式下不持有写锁，因此状态查询不阻塞任何季度的明细提交或发布
+（查询仍看到它开始时的完整旧状态）。明细提交与遮盖保存的响应也在同一写事务内读取，
+返回的就是本次写入后的状态；写入失败会整体回滚，原状态不变。
+
+### 7. 公开查询
 
 `GET /api/v1/bulletins/{quarter}`（公开，无需令牌；不存在时 404，季度格式不合法时 422）
 
@@ -171,6 +185,8 @@ Dockerfile / docker-compose.yml
 * **合计不可改**：公报数字一旦登记就作为约束存在；纠正错误应改用新季度或新版本体系，而不是静默改数。
 * **遮盖计划绑定明细版本**：明细变了就不再有任何「旧遮盖可复用」的歧义，发布时能明确报出
   `mask_plan_superseded`。
+* **状态读取用读快照**：状态接口的所有 `SELECT` 在同一个 `BEGIN DEFERRED` 事务里完成，
+  一次返回一份完整快照；WAL 下只读不写锁，不会挡住其它写入。
 * **保存与发布分离**：编辑可以先保存一份尚不完整的遮盖（带 `analysis.valid=false` 提示），
   但发布必须完整合规，复核在发布瞬间进行。
 * **公开载荷最小化**：公开接口只返回合计与可见格；明细版本、遮盖计划、必公开清单等内部
